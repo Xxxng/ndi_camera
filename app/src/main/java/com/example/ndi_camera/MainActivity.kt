@@ -46,23 +46,37 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         viewBinding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(viewBinding.root)
-
-        if (allPermissionsGranted()) {
-            startCamera()
-            setupNDI()
-        } else {
-            ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
-        }
-
         cameraExecutor = Executors.newSingleThreadExecutor()
     }
 
-    private fun setupNDI() {
-        isNDIStarted = startNDISend("Android Camera")
-        if (isNDIStarted) {
-            Log.d(TAG, "NDI Sender started successfully")
+    override fun onResume() {
+        super.onResume()
+        if (allPermissionsGranted()) {
+            setupNDI()
+            startCamera()
         } else {
-            Log.e(TAG, "Failed to start NDI Sender")
+            ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        // 백그라운드 전환 시 NDI 중지 (가이드 권장 사항)
+        if (isNDIStarted) {
+            stopNDISend()
+            isNDIStarted = false
+            Log.d(TAG, "NDI Sender stopped onPause")
+        }
+    }
+
+    private fun setupNDI() {
+        if (!isNDIStarted) {
+            isNDIStarted = startNDISend("Android Camera Optimized")
+            if (isNDIStarted) {
+                Log.d(TAG, "NDI Sender started successfully")
+            } else {
+                Log.e(TAG, "Failed to start NDI Sender")
+            }
         }
     }
 
@@ -105,6 +119,7 @@ class MainActivity : AppCompatActivity() {
     private fun processImageForNDI(imageProxy: ImageProxy) {
         try {
             val planes = imageProxy.planes
+            // UYVY는 2픽셀당 하나의 UV를 공유하므로 짝수 해상도가 권장됨
             sendVideoFrame(
                 planes[0].buffer, planes[0].rowStride,
                 planes[1].buffer, planes[1].rowStride,
@@ -125,9 +140,6 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        if (isNDIStarted) {
-            stopNDISend()
-        }
         cameraExecutor.shutdown()
     }
 
@@ -137,8 +149,8 @@ class MainActivity : AppCompatActivity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQUEST_CODE_PERMISSIONS) {
             if (allPermissionsGranted()) {
-                startCamera()
                 setupNDI()
+                startCamera()
             } else {
                 Toast.makeText(this, "Permissions not granted.", Toast.LENGTH_SHORT).show()
                 finish()
