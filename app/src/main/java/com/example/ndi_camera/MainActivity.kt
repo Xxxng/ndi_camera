@@ -2,9 +2,9 @@ package com.example.ndi_camera
 
 import android.Manifest
 import android.content.pm.PackageManager
-import android.graphics.*
 import android.os.Bundle
 import android.util.Log
+import android.util.Size
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
@@ -12,7 +12,6 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.example.ndi_camera.databinding.ActivityMainBinding
-import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -25,7 +24,13 @@ class MainActivity : AppCompatActivity() {
     // Native functions
     private external fun startNDISend(name: String): Boolean
     private external fun stopNDISend()
-    private external fun sendVideoFrame(data: ByteArray, width: Int, height: Int)
+    private external fun sendVideoFrame(
+        yBuffer: ByteBuffer, yStride: Int,
+        uBuffer: ByteBuffer, uStride: Int,
+        vBuffer: ByteBuffer, vStride: Int,
+        pixelStride: Int,
+        width: Int, height: Int
+    )
 
     companion object {
         private const val TAG = "NDICamera"
@@ -99,43 +104,19 @@ class MainActivity : AppCompatActivity() {
 
     private fun processImageForNDI(imageProxy: ImageProxy) {
         try {
-            val rgbaBuffer = yuvToRgba(imageProxy)
-            sendVideoFrame(rgbaBuffer, imageProxy.width, imageProxy.height)
+            val planes = imageProxy.planes
+            sendVideoFrame(
+                planes[0].buffer, planes[0].rowStride,
+                planes[1].buffer, planes[1].rowStride,
+                planes[2].buffer, planes[2].rowStride,
+                planes[1].pixelStride,
+                imageProxy.width, imageProxy.height
+            )
         } catch (e: Exception) {
             Log.e(TAG, "Error processing image: ${e.message}")
         } finally {
             imageProxy.close()
         }
-    }
-
-    private fun yuvToRgba(image: ImageProxy): ByteArray {
-        val yBuffer = image.planes[0].buffer // Y
-        val uBuffer = image.planes[1].buffer // U
-        val vBuffer = image.planes[2].buffer // V
-
-        val ySize = yBuffer.remaining()
-        val uSize = uBuffer.remaining()
-        val vSize = vBuffer.remaining()
-
-        val nv21 = ByteArray(ySize + uSize + vSize)
-
-        // NV21 포맷으로 복사 (YUV_420_888 -> NV21)
-        yBuffer.get(nv21, 0, ySize)
-        vBuffer.get(nv21, ySize, vSize)
-        uBuffer.get(nv21, ySize + vSize, uSize)
-
-        val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
-        val out = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), 100, out)
-        val imageBytes = out.toByteArray()
-        val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
-
-        // RGBA로 변환
-        val argbBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true)
-        val byteBuffer = ByteBuffer.allocate(argbBitmap.byteCount)
-        argbBitmap.copyPixelsToBuffer(byteBuffer)
-        
-        return byteBuffer.array()
     }
 
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
