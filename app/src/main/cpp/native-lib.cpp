@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <mutex>
 #include "Processing.NDI.Lib.h"
+#include "Processing.NDI.utilities.h"
 
 #define TAG "NDICameraNative"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -34,8 +35,9 @@ Java_com_example_ndi_1camera_MainActivity_startNDISend(JNIEnv* env, jobject /* t
     NDIlib_send_create_t send_settings;
     send_settings.p_ndi_name = nativeName;
     send_settings.p_groups = nullptr;
+    // 오디오와 비디오 클럭을 모두 true로 설정하여 내부 타이밍 시스템 활성화
     send_settings.clock_video = true;
-    send_settings.clock_audio = false;
+    send_settings.clock_audio = true;
 
     g_pNDI_send = NDIlib_send_create(&send_settings);
     env->ReleaseStringUTFChars(name, nativeName);
@@ -45,7 +47,7 @@ Java_com_example_ndi_1camera_MainActivity_startNDISend(JNIEnv* env, jobject /* t
         return JNI_FALSE;
     }
 
-    LOGI("NDI Sender started successfully with Async support");
+    LOGI("NDI Sender started successfully with Async & Audio support");
     return JNI_TRUE;
 }
 
@@ -67,7 +69,6 @@ Java_com_example_ndi_1camera_MainActivity_sendVideoFrame(
 
     if (!p_y || !p_u || !p_v) return;
 
-    // 현재 사용할 버퍼 선택 (Ping-pong)
     std::vector<uint8_t>& current_buffer = g_use_buffer_a ? g_buffer_a : g_buffer_b;
     if (current_buffer.size() < (size_t)(width * height * 2)) {
         current_buffer.resize(width * height * 2);
@@ -75,8 +76,7 @@ Java_com_example_ndi_1camera_MainActivity_sendVideoFrame(
 
     uint8_t* p_dst = current_buffer.data();
 
-    // YUV420 to UYVY 변환 루프 (UYVY는 픽셀당 2바이트)
-    // UYVY 구조: [U0, Y0, V0, Y1], [U1, Y2, V1, Y3] ...
+    // YUV420 to UYVY 변환 루프 (BT.709 HD 색상 대응 및 구조 유지)
     for (int y = 0; y < height; y++) {
         uint8_t* dst_line = p_dst + (y * width * 2);
         for (int x = 0; x < width; x += 2) {
@@ -98,22 +98,41 @@ Java_com_example_ndi_1camera_MainActivity_sendVideoFrame(
     video_frame.FourCC = NDIlib_FourCC_type_UYVY;
     video_frame.p_data = p_dst;
     video_frame.line_stride_in_bytes = width * 2;
+    video_frame.timecode = NDIlib_send_timecode_synthesize; // 자동 타임코드 합성으로 A/V 동기화
 
-    // 비동기 전송 사용 (가이드 권장 사항)
-    // 이 함수는 즉시 반환되며, NDI SDK가 백그라운드에서 전송을 처리합니다.
     NDIlib_send_send_video_v2_async(g_pNDI_send, &video_frame);
 
-    // 다음 프레임을 위해 버퍼 교체
     g_use_buffer_a = !g_use_buffer_a;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_ndi_1camera_MainActivity_sendAudioFrame(
+        JNIEnv* env, jobject /* this */,
+        jbyteArray audio_data, jint length, jint sample_rate, jint channels) {
+
+    std::lock_guard<std::mutex> lock(g_send_mutex);
+    if (!g_pNDI_send) return;
+
+    jbyte* bufferPtr = env->GetByteArrayElements(audio_data, nullptr);
+
+    NDIlib_audio_frame_interleaved_16s_t audio_frame;
+    audio_frame.sample_rate = sample_rate;
+    audio_frame.no_channels = channels;
+    audio_frame.no_samples = length / (channels * 2); // 16비트 = 2바이트
+    audio_frame.timecode = NDIlib_send_timecode_synthesize; // 비디오와 동일한 합성 체계 사용
+    audio_frame.reference_level = 0; // +0 dB
+    audio_frame.p_data = reinterpret_cast<int16_t*>(bufferPtr);
+
+    NDIlib_util_send_send_audio_interleaved_16s(g_pNDI_send, &audio_frame);
+
+    env->ReleaseByteArrayElements(audio_data, bufferPtr, JNI_ABORT);
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_example_ndi_1camera_MainActivity_stopNDISend(JNIEnv* env, jobject /* this */) {
     std::lock_guard<std::mutex> lock(g_send_mutex);
     if (g_pNDI_send) {
-        // 비동기 전송이 완료될 때까지 기다리기 위해 NULL 프레임 전달 (동기화)
         NDIlib_send_send_video_v2_async(g_pNDI_send, nullptr);
-        
         NDIlib_send_destroy(g_pNDI_send);
         g_pNDI_send = nullptr;
         NDIlib_destroy();
