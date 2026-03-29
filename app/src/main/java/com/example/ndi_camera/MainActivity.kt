@@ -2,45 +2,63 @@ package com.example.ndi_camera
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.graphics.*
 import android.os.Bundle
 import android.util.Log
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.Preview
+import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.example.ndi_camera.databinding.ActivityMainBinding
+import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 class MainActivity : AppCompatActivity() {
     private lateinit var viewBinding: ActivityMainBinding
     private lateinit var cameraExecutor: ExecutorService
+    private var isNDIStarted = false
 
-    // NDI 관련 변수 (SDK가 프로젝트에 포함되어야 함)
-    // private var ndiInstance: Long = 0
+    // Native functions
+    private external fun startNDISend(name: String): Boolean
+    private external fun stopNDISend()
+    private external fun sendVideoFrame(data: ByteArray, width: Int, height: Int)
+
+    companion object {
+        private const val TAG = "NDICamera"
+        private const val REQUEST_CODE_PERMISSIONS = 10
+        private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
+
+        init {
+            System.loadLibrary("ndi_camera")
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         viewBinding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(viewBinding.root)
 
-        // 권한 체크
         if (allPermissionsGranted()) {
             startCamera()
+            setupNDI()
         } else {
-            ActivityCompat.requestPermissions(
-                this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS
-            )
+            ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
         }
 
         cameraExecutor = Executors.newSingleThreadExecutor()
-        
-        // NDI 초기화 (예시 - 실제 SDK 함수명은 버전에 따라 다를 수 있음)
-        // initNDI()
+    }
+
+    private fun setupNDI() {
+        isNDIStarted = startNDISend("Android Camera")
+        if (isNDIStarted) {
+            Log.d(TAG, "NDI Sender started successfully")
+        } else {
+            Log.e(TAG, "Failed to start NDI Sender")
+        }
     }
 
     private fun startCamera() {
@@ -49,22 +67,21 @@ class MainActivity : AppCompatActivity() {
         cameraProviderFuture.addListener({
             val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
 
-            // Preview
-            val preview = Preview.Builder()
-                .build()
-                .also {
-                    it.setSurfaceProvider(viewBinding.viewFinder.surfaceProvider)
-                }
+            val preview = Preview.Builder().build().also {
+                it.setSurfaceProvider(viewBinding.viewFinder.surfaceProvider)
+            }
 
-            // ImageAnalysis - 여기서 프레임 데이터를 NDI로 전달
             val imageAnalyzer = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setTargetResolution(Size(1280, 720))
                 .build()
                 .also {
                     it.setAnalyzer(cameraExecutor) { imageProxy ->
-                        // imageProxy에서 데이터를 추출하여 NDI로 전송하는 로직
-                        processImageForNDI(imageProxy)
-                        imageProxy.close()
+                        if (isNDIStarted) {
+                            processImageForNDI(imageProxy)
+                        } else {
+                            imageProxy.close()
+                        }
                     }
                 }
 
@@ -72,9 +89,7 @@ class MainActivity : AppCompatActivity() {
 
             try {
                 cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(
-                    this, cameraSelector, preview, imageAnalyzer
-                )
+                cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalyzer)
             } catch (exc: Exception) {
                 Log.e(TAG, "Use case binding failed", exc)
             }
@@ -82,10 +97,45 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    private fun processImageForNDI(imageProxy: androidx.camera.core.ImageProxy) {
-        // TODO: YUV_420_888 -> RGBA/UYVY 변환 및 NDI Send 호출
-        // NDI SDK의 sendSendVideoV2(ndiInstance, videoFrame) 등을 호출해야 합니다.
-        // 이 부분은 고성능 변환을 위해 JNI(C++) 레이어에서 처리하는 것이 일반적입니다.
+    private fun processImageForNDI(imageProxy: ImageProxy) {
+        try {
+            val rgbaBuffer = yuvToRgba(imageProxy)
+            sendVideoFrame(rgbaBuffer, imageProxy.width, imageProxy.height)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error processing image: ${e.message}")
+        } finally {
+            imageProxy.close()
+        }
+    }
+
+    private fun yuvToRgba(image: ImageProxy): ByteArray {
+        val yBuffer = image.planes[0].buffer // Y
+        val uBuffer = image.planes[1].buffer // U
+        val vBuffer = image.planes[2].buffer // V
+
+        val ySize = yBuffer.remaining()
+        val uSize = uBuffer.remaining()
+        val vSize = vBuffer.remaining()
+
+        val nv21 = ByteArray(ySize + uSize + vSize)
+
+        // NV21 포맷으로 복사 (YUV_420_888 -> NV21)
+        yBuffer.get(nv21, 0, ySize)
+        vBuffer.get(nv21, ySize, vSize)
+        uBuffer.get(nv21, ySize + vSize, uSize)
+
+        val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
+        val out = ByteArrayOutputStream()
+        yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), 100, out)
+        val imageBytes = out.toByteArray()
+        val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+
+        // RGBA로 변환
+        val argbBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true)
+        val byteBuffer = ByteBuffer.allocate(argbBitmap.byteCount)
+        argbBitmap.copyPixelsToBuffer(byteBuffer)
+        
+        return byteBuffer.array()
     }
 
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
@@ -94,15 +144,10 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        if (isNDIStarted) {
+            stopNDISend()
+        }
         cameraExecutor.shutdown()
-        // NDI 종료 처리
-        // if (ndiInstance != 0L) { NDIlib.sendDestroy(ndiInstance) }
-    }
-
-    companion object {
-        private const val TAG = "NDICamera"
-        private const val REQUEST_CODE_PERMISSIONS = 10
-        private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
     }
 
     override fun onRequestPermissionsResult(
@@ -112,8 +157,9 @@ class MainActivity : AppCompatActivity() {
         if (requestCode == REQUEST_CODE_PERMISSIONS) {
             if (allPermissionsGranted()) {
                 startCamera()
+                setupNDI()
             } else {
-                Toast.makeText(this, "Permissions not granted by the user.", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Permissions not granted.", Toast.LENGTH_SHORT).show()
                 finish()
             }
         }

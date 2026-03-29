@@ -43,6 +43,26 @@ Java_com_example_ndi_1camera_MainActivity_startNDISend(JNIEnv* env, jobject /* t
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_com_example_ndi_1camera_MainActivity_sendVideoFrame(JNIEnv* env, jobject /* this */, jbyteArray data, jint width, jint height) {
+    if (!g_pNDI_send) return;
+
+    jbyte* bufferPtr = env->GetByteArrayElements(data, nullptr);
+
+    // NDI 비디오 프레임 설정
+    NDIlib_video_frame_v2_t video_frame;
+    video_frame.xres = width;
+    video_frame.yres = height;
+    video_frame.FourCC = NDIlib_FourCC_type_RGBA;
+    video_frame.p_data = reinterpret_cast<uint8_t*>(bufferPtr);
+    video_frame.line_stride_in_bytes = width * 4;
+
+    // 프레임 전송
+    NDIlib_send_send_video_v2(g_pNDI_send, &video_frame);
+
+    env->ReleaseByteArrayElements(data, bufferPtr, JNI_ABORT);
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_com_example_ndi_1camera_MainActivity_stopNDISend(JNIEnv* env, jobject /* this */) {
     if (g_pNDI_send) {
         NDIlib_send_destroy(g_pNDI_send);
